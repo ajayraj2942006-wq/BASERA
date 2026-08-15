@@ -3,6 +3,7 @@ import{createRoot}from"react-dom/client";
 import{Home,Search,MessageCircle,ShieldCheck,AlertTriangle,Navigation,Camera,Building2,Users,IndianRupee,CheckCircle2,Mic,MapPin,FileText,ChevronRight,Menu,X,Languages,ArrowLeft,Calculator,Filter,Heart,Phone,Info,BarChart3}from"lucide-react";
 import listingData from"../basera-housing-120.json";
 import"./styles.css";
+import axios from "axios";
 
 const LOCATION_COORDS = {
   "saravanampatti": { lat: 11.0848, lng: 76.9897 },
@@ -64,6 +65,12 @@ const homes = Array.isArray(listingData) ? listingData.map((h,index)=>({
 })) : [];
 const fair=h=>Math.round(Math.max(0,100-Math.abs(h.rent-h.avg)/h.avg*100));
 const risk=h=>!h.verified?"MEDIUM":h.rent<h.avg*.7?"HIGH":"LOW";
+const getConvenienceScore=(home,budget,maxCommute,people)=>{
+  const rentScore = Math.max(0, 100 - (Math.abs(home.rent - budget) / Math.max(budget, 1)) * 100);
+  const commuteScore = Math.max(0, 100 - (Math.max(0, home.commute - maxCommute) / Math.max(maxCommute, 1)) * 100);
+  const roomScore = home.beds >= people ? 100 : Math.max(0, 100 - ((people - home.beds) * 25));
+  return Math.round((rentScore * 0.45) + (commuteScore * 0.35) + (roomScore * 0.1) + (home.safety * 0.1));
+};
 
 function Badge({children}){return <span className="badge">{children}</span>}
 function Score({v,label}){return <div className="score"><b>{v}</b><small>{label}</small></div>}
@@ -90,6 +97,7 @@ function App(){
  const go=p=>{setPage(p);setMenu(false);scrollTo(0,0)};
  const matches=useMemo(()=>{
   const q=(work||"").toLowerCase().trim();
+  const maxCommute = Number(filters.maxCommute || 30);
 
   let locationMatches = homes;
   if(q){
@@ -99,12 +107,16 @@ function App(){
     });
   }
 
-  const exactMatches = locationMatches.filter(h=>h.rent<=budget && h.commute<=filters.maxCommute && (!filters.verified || h.verified));
-  const nearbyMatches = locationMatches.filter(h=>h.rent<=Math.round(budget*1.2) && h.commute<=Math.max(filters.maxCommute, 30) && (!filters.verified || h.verified));
-  const candidates = exactMatches.length ? exactMatches : nearbyMatches.length ? nearbyMatches : locationMatches.filter(h=>h.commute<=Math.max(filters.maxCommute, 30) && (!filters.verified || h.verified));
+  const exactMatches = locationMatches.filter(h=>h.rent<=budget && h.commute<=maxCommute && (!filters.verified || h.verified));
+  const relaxedBudgetMatches = locationMatches.filter(h=>h.rent<=Math.round(budget*1.2) && h.commute<=maxCommute && (!filters.verified || h.verified));
+  const candidates = exactMatches.length ? exactMatches : relaxedBudgetMatches.length ? relaxedBudgetMatches : locationMatches.filter(h=>h.commute<=maxCommute && (!filters.verified || h.verified));
 
-  return candidates.sort((a,b)=>sort==="rent"?a.rent-b.rent:sort==="commute"?a.commute-b.commute:((fair(b)+b.safety+b.clean+(100-b.commute))/4)-((fair(a)+a.safety+a.clean+(100-a.commute))/4));
- },[work,budget,filters,sort]);
+  return candidates.sort((a,b)=>{
+    if(sort==="rent") return a.rent-b.rent;
+    if(sort==="commute") return a.commute-b.commute;
+    return getConvenienceScore(b, budget, maxCommute, people) - getConvenienceScore(a, budget, maxCommute, people);
+  });
+ },[work,budget,filters,sort,people]);
 
  const budgetCompare = useMemo(()=>{
   if(!matches.length) return { avgNearby: 0, maxNearby: 0, minNearby: 0, remaining: budget };
@@ -130,7 +142,52 @@ const featureMetrics = [
   { title: "Scam Check", value: `${verifiedCount}/${homes.length}`, detail: "Verified listings" },
   { title: "Sanitation", value: `${sanitationRate}%`, detail: "Healthy sanitation score" }
  ];
- const send=()=>{if(!chat.trim())return;let q=chat.trim();setMessages(m=>[...m,{from:"user",text:q},{from:"bot",text:`I’ll search around ${work} for homes under ₹${budget.toLocaleString()} for ${people} person${people>1?"s":""}. I’ll compare rent, commute, safety and sanitation.`}]);setChat("")};
+const send = async () => {
+  if(!chat.trim()) return;
+
+  const q = chat.trim();
+  setMessages(m => [...m, { from: "user", text: q }]);
+  setChat("");
+
+  try {
+    const response = await axios.post('/api/chat', { message: q });
+    const reply = response?.data?.reply || "I’m not sure yet. Please try a housing question like budget, location, or a shared room.";
+    setMessages(m => [...m, { from: "bot", text: reply }]);
+
+    if (response?.data?.filters?.location) {
+      setWork(response.data.filters.location);
+    }
+
+    if (response?.data?.filters?.maxBudget) {
+      setBudget(response.data.filters.maxBudget);
+    }
+
+    if (response?.data?.filters?.people) {
+      setPeople(response.data.filters.people);
+    }
+
+    if (response?.data?.count > 0) {
+      setPage("results");
+    }
+  } catch (error) {
+    console.error('Chat request failed:', error);
+    setMessages(m => [...m, { from: "bot", text: "Basera AI is temporarily unavailable. Please try again with a clearer housing question." }]);
+  }
+};
+
+const sendMatchesToWhatsApp = async (phone) => {
+  try {
+    const top = matches.slice(0,5).map((h,i)=>`${i+1}. ${h.name} · ₹${h.rent} · ${h.commute}m · ${h.area}`).join('\n');
+    const message = `BASERA matches near ${work} under ₹${budget}:\n\n${top}`;
+
+    const resp = await axios.post('/api/send-whatsapp', { to: phone, message });
+
+    alert('Message sent: ' + (resp.data?.success ? 'OK' : 'Failed'));
+  } catch (err) {
+    console.error(err);
+    alert('Failed to send WhatsApp message. Check server logs and .env config.');
+  }
+};
  const open=h=>{setSelected(h);go("detail")};
 
  return <div>
@@ -147,13 +204,13 @@ const featureMetrics = [
   <section className="flow"><div><Badge>BASERA FLOW</Badge><h2>Search → Compare → Share → Stay → Report</h2><p>Built around the worker's real journey.</p></div><button className="primary" onClick={()=>go("search")}>Start housing search <ChevronRight/></button></section>
  </>}
 
- {page==="search"&&<><Back go={go} to="home"/><Badge>HOUSING SEARCH</Badge><h1>Find a home that fits your life.</h1><div className="searchBox"><label>WORKPLACE<input value={work} onChange={e=>setWork(e.target.value)}/></label><label>MAX RENT<div className="range"><input type="range" min="2500" max="7000" step="100" value={budget} onChange={e=>setBudget(+e.target.value)}/><b>₹{budget.toLocaleString()}</b></div></label><label>PEOPLE<select value={people} onChange={e=>setPeople(+e.target.value)}>{[1,2,3,4].map(x=><option key={x}>{x}</option>)}</select></label><button className="primary" onClick={()=>go("results")}>Search <Search/></button></div><div className="quickFilters"><Badge>Fair rent</Badge><Badge>Verified</Badge><Badge>≤ 15 min</Badge><Badge>Shared rooms</Badge></div><div className="how"><Info/><span>Basera compares rent with nearby homes and considers commute time, safety and cleanliness when ranking matches.</span></div></>}
+ {page==="search"&&<> <Back go={go} to="home"/><Badge>HOUSING SEARCH</Badge><h1>Find a home that fits your life.</h1><div className="searchBox"><label>WORKPLACE<input value={work} onChange={e=>setWork(e.target.value)}/></label><label>MAX RENT<div className="range"><input type="range" min="2500" max="7000" step="100" value={budget} onChange={e=>setBudget(+e.target.value)}/><b>₹{budget.toLocaleString()}</b></div></label><label>COMMUTE PREFERENCE<select value={filters.maxCommute} onChange={e=>setFilters(f=>({...f,maxCommute:+e.target.value}))}><option value="30">Any commute ≤30 min</option><option value="20">Comfort ≤20 min</option><option value="15">Very convenient ≤15 min</option><option value="10">Strict ≤10 min</option></select></label><label>PEOPLE<select value={people} onChange={e=>setPeople(+e.target.value)}>{[1,2,3,4].map(x=><option key={x}>{x}</option>)}</select></label><button className="primary" onClick={()=>go("results")}>Search <Search/></button></div><div className="quickFilters"><Badge>Fair rent</Badge><Badge>Verified</Badge><Badge>≤ {filters.maxCommute} min</Badge><Badge>Shared rooms</Badge></div><div className="how"><Info/><span>Basera now ranks homes by what feels convenient for the worker: monthly rent, travel time to work, and room fit for the chosen people count.</span></div></>}
 
- {page==="results"&&<><Back go={go} to="search"/><div className="resultHead"><div><Badge>SMART MATCHES</Badge><h1>Homes near {work}</h1><p className="muted">{matches.length} homes · under ₹{budget.toLocaleString()} · {people} person{people>1?"s":""}</p></div><select value={sort} onChange={e=>setSort(e.target.value)}><option value="match">Best match</option><option value="rent">Lowest rent</option><option value="commute">Shortest commute</option></select></div><div className="filterbar"><button onClick={()=>setFilters(f=>({...f,verified:!f.verified}))}><ShieldCheck/> Verified only {filters.verified?"✓":""}</button><select value={filters.maxCommute} onChange={e=>setFilters(f=>({...f,maxCommute:+e.target.value}))}><option value="30">Any commute ≤30 min</option><option value="15">≤15 min</option><option value="10">≤10 min</option></select><span><Filter/> {matches.length} matches</span></div><div className="how"><Info/><span>Budget check: nearby rooms average ₹{budgetCompare.avgNearby.toLocaleString()} with a max of ₹{budgetCompare.maxNearby.toLocaleString()} in your search area.</span></div><div className="homeGrid">{matches.map(h=><HomeCard h={h} key={h.id} work={work} budget={budget} fav={favs.includes(h.id)} onFav={id=>setFavs(f=>f.includes(id)?f.filter(x=>x!==id):[...f,id])} onOpen={open}/>)}</div></>}
+ {page==="results"&&<><Back go={go} to="search"/><div className="resultHead"><div><Badge>SMART MATCHES</Badge><h1>Homes near {work}</h1><p className="muted">{matches.length} homes · under ₹{budget.toLocaleString()} · {people} person{people>1?"s":""} · commute ≤ {filters.maxCommute} min</p></div><select value={sort} onChange={e=>setSort(e.target.value)}><option value="match">Best convenience</option><option value="rent">Lowest rent</option><option value="commute">Shortest commute</option></select></div><div className="filterbar"><button onClick={()=>setFilters(f=>({...f,verified:!f.verified}))}><ShieldCheck/> Verified only {filters.verified?"✓":""}</button><select value={filters.maxCommute} onChange={e=>setFilters(f=>({...f,maxCommute:+e.target.value}))}><option value="30">Any commute ≤30 min</option><option value="20">Comfort ≤20 min</option><option value="15">≤15 min</option><option value="10">≤10 min</option></select><span><Filter/> {matches.length} matches</span></div><div className="how"><Info/><span>Exact commute check: results only include homes within your selected commute limit of {filters.maxCommute} minutes. Budget is used as a secondary filter, with the same commute rule always kept strict.</span></div><div className="homeGrid">{matches.map(h=><HomeCard h={h} key={h.id} work={work} budget={budget} fav={favs.includes(h.id)} onFav={id=>setFavs(f=>f.includes(id)?f.filter(x=>x!==id):[...f,id])} onOpen={open}/>)}</div></>}
 
- {page==="detail"&&<><Back go={go} to="results"/><div className="detail"><div className="propertyImage"><Badge>{selected.verified?"✓ VERIFIED OWNER":"⚠ VERIFY OWNER"}</Badge><h2>{selected.name}</h2><p>{selected.area}</p></div><div className="panel"><div className="titleRow"><div><Badge>SMART MATCH</Badge><h1>{selected.name}</h1></div><b className="match">{Math.round((fair(selected)+selected.safety+selected.clean+100-selected.commute)/4)}%</b></div><p><MapPin/> {selected.area}</p><div className="priceBig">₹{selected.rent.toLocaleString()} <small>/ month</small></div><div className="fair"><div><b>Fair rent comparison</b><span>Nearby average: ₹{selected.avg.toLocaleString()}</span></div><strong>{selected.rent<=selected.avg?"✓ FAIR":"⚠ ABOVE AVERAGE"}<small>{Math.round((selected.rent-selected.avg)/selected.avg*100)}% vs average</small></strong></div><div className="scores"><Score v={fair(selected)} label="FAIR RENT"/><Score v={selected.safety} label="SAFETY"/><Score v={selected.clean} label="CLEAN"/><Score v={selected.commute+"m"} label="COMMUTE"/></div><div className="facts"><span><Navigation/> {selected.commute} min commute</span><span><Users/> {selected.beds} beds</span><span><IndianRupee/> ₹{selected.deposit.toLocaleString()} deposit</span><span><ShieldCheck/> Scam risk: {risk(selected)}</span></div><div className="owner"><div className="avatar">{selected.owner[0]}</div><div><b>{selected.owner}</b><small>{selected.verified?"Verified owner":"Verification pending"}</small></div><button><Phone/></button></div><button className="primary full" onClick={()=>go("split")}><Users/> Check rent split</button><button className="outline full" onClick={()=>go("complaint")}>Report housing problem</button></div></div></>}
+ {page==="detail"&&<><Back go={go} to="results"/><div className="detail"><div className="propertyImage"><Badge>{selected.verified?"✓ VERIFIED OWNER":"⚠ VERIFY OWNER"}</Badge><h2>{selected.name}</h2><p>{selected.area}</p></div><div className="panel"><div className="titleRow"><div><Badge>SMART MATCH</Badge><h1>{selected.name}</h1></div><b className="match">{getConvenienceScore(selected, budget, Number(filters.maxCommute || 30), people)}%</b></div><p><MapPin/> {selected.area}</p><div className="priceBig">₹{selected.rent.toLocaleString()} <small>/ month</small></div><div className="fair"><div><b>Worker convenience</b><span>{selected.commute <= filters.maxCommute ? "Fits your commute preference" : `Above your preferred ${filters.maxCommute} min`}</span></div><strong>{selected.rent<=budget?"✓ WITHIN BUDGET":"⚠ ABOVE TARGET"}<small>{selected.rent<=budget ? "Affordable for your budget" : `₹${(selected.rent-budget).toLocaleString()} over target`}</small></strong></div><div className="scores"><Score v={fair(selected)} label="FAIR RENT"/><Score v={selected.safety} label="SAFETY"/><Score v={selected.clean} label="CLEAN"/><Score v={selected.commute+"m"} label="COMMUTE"/></div><div className="facts"><span><Navigation/> {selected.commute} min commute</span><span><Users/> {selected.beds} beds</span><span><IndianRupee/> ₹{selected.deposit.toLocaleString()} deposit</span><span><ShieldCheck/> Scam risk: {risk(selected)}</span></div><div className="owner"><div className="avatar">{selected.owner[0]}</div><div><b>{selected.owner}</b><small>{selected.verified?"Verified owner":"Verification pending"}</small></div><button><Phone/></button></div><button className="primary full" onClick={()=>go("split")}><Users/> Check rent split</button><button className="outline full" onClick={()=>go("complaint")}>Report housing problem</button></div></div></>}
 
- {page==="split"&&<><Back go={go} to="detail"/><Badge>RENT SPLIT</Badge><h1>Split the rent fairly.</h1><div className="splitGrid"><div className="panel"><h2>{selected.name}</h2><p>Choose how many people share this room.</p><div className="people">{[1,2,3,4].map(n=><button className={share===n?"selected":""} onClick={()=>setShare(n)} key={n}>{n}<small>person{n>1?"s":""}</small></button>)}</div><div className="calculator"><span>Total monthly rent</span><b>₹{selected.rent.toLocaleString()}</b><span>Per person</span><b>₹{Math.ceil(selected.rent/share).toLocaleString()}</b><span>Deposit / person</span><b>₹{Math.ceil(selected.deposit/share).toLocaleString()}</b></div><button className="primary full" onClick={()=>go("agreement")}><FileText/> Create sharing template</button></div><div className="panel"><Calculator/><h2>Why this matters</h2><p>Basera makes the split visible before workers agree to share a room.</p><div className="tip">✓ Everyone sees the same rent<br/>✓ Beds are visible<br/>✓ Deposit is transparent<br/>✓ Use a written sharing template</div></div></div></>}
+ {page==="split"&&<><Back go={go} to="detail"/><Badge>RENT SPLIT</Badge><h1>Split the rent fairly.</h1><div className="splitGrid"><div className="panel"><h2>{selected.name}</h2><p>Choose how many people share this room.</p><div className="people">{[1,2,3,4].map(n=><button className={share===n?"selected":""} onClick={()=>setShare(n)} key={n}>{n}<small>person{n>1?"s":""}</small></button>)}</div><div className="calculator"><span>Total monthly rent</span><b>₹{selected.rent.toLocaleString()}</b><span>Per person</span><b>₹{Math.ceil(selected.rent/share).toLocaleString()}</b><span>Deposit / person</span><b>₹{Math.ceil(selected.deposit/share).toLocaleString()}</b></div><div className="mini"><Info/> {selected.commute <= filters.maxCommute ? "Comfortable for your daily travel." : "This commute is longer than your preferred limit, so it may feel tiring."}</div><button className="primary full" onClick={()=>go("agreement")}><FileText/> Create sharing template</button></div><div className="panel"><Calculator/><h2>Why this matters</h2><p>Basera makes the split visible before workers agree to share a room.</p><div className="tip">✓ Everyone sees the same rent<br/>✓ Beds are visible<br/>✓ Deposit is transparent<br/>✓ Travel burden is considered before signing</div></div></div></>}
 
  {page==="agreement"&&<><Back go={go} to="split"/><div className="document"><Badge>SHARING TEMPLATE</Badge><h1>Room-sharing agreement</h1><p className="muted">Prototype template — not a legal document.</p><div className="paper"><h2>Basera Room Sharing</h2><p><b>Property:</b> {selected.name}</p><p><b>Location:</b> {selected.area}</p><p><b>Total rent:</b> ₹{selected.rent.toLocaleString()} / month</p><p><b>People:</b> {share}</p><p><b>Rent per person:</b> ₹{Math.ceil(selected.rent/share).toLocaleString()}</p><p><b>Deposit per person:</b> ₹{Math.ceil(selected.deposit/share).toLocaleString()}</p><hr/><h3>Shared responsibilities</h3><p>□ Rent payment responsibility</p><p>□ Shared-space cleanliness</p><p>□ Visitors and noise</p><p>□ Notice and move-out understanding</p><hr/><div className="sign"><span>Worker signature</span><span>Owner signature</span></div></div><button className="outline"><FileText/> Download / Print template</button></div></>}
 
@@ -164,7 +221,7 @@ const featureMetrics = [
  {page==="dashboard"&&<><Badge>NGO / CITY DASHBOARD</Badge><h1>Housing intelligence.</h1><p className="muted">Pilot view for worker housing, rent pressure, commute and sanitation.</p><div className="stats">{[["1,284","Workers reached"],["327","Housing matches"],["₹3,900","Avg listed rent"],["86","Complaints"],["62","Resolved"],["72%","Resolution rate"]].map(([n,l])=><div className="stat" key={l}><b>{n}</b><span>{l}</span></div>)}</div><div className="dashGrid"><div className="panel"><h2><BarChart3/> Rent pressure</h2>{[["SIDCO Industrial Estate",82],["Kurumbapalayam",68],["Peelamedu",54],["Saravanampatti",47]].map(([x,v])=><div className="bar" key={x}><span>{x}</span><b>{v}%</b></div>)}</div><div className="panel"><h2><AlertTriangle/> Sanitation queue</h2><p><b>86</b> reported · <b>24</b> open · <b>62</b> resolved</p><button className="outline full" onClick={()=>go("complaint")}>Open complaint tracker</button></div></div></>}
  </main>
  <footer>BASERA · Shelter, Made Fair · V3 Hackathon Prototype</footer>
- <nav className="bottom"><button onClick={()=>go("home")}><Home/>Home</button><button onClick={()=>go("chat")}><MessageCircle/>AI</button><button onClick={()=>go("search")}><Search/>Find</button><button onClick={()=>go("complaint")}><AlertTriangle/>Report</button><button onClick={()=>go("dashboard")}><Building2/>NGO</button></nav>
+<nav className="bottom"><button onClick={()=>go("home")}><Home/>Home</button><button onClick={()=>go("chat")}><MessageCircle/>AI</button><button onClick={()=>go("search")}><Search/>Find</button><button onClick={()=>go("complaint")}><AlertTriangle/>Report</button><button onClick={()=>go("dashboard")}><Building2/>NGO</button><button onClick={()=>{const phone=prompt('Enter phone number with country code (e.g. 919900112233):'); if(phone) sendMatchesToWhatsApp(phone);}}>WhatsApp</button></nav>
  </div>
 }
 createRoot(document.getElementById("root")).render(<App/>);

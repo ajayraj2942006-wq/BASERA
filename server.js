@@ -1,5 +1,6 @@
 const express = require("express");
-const twilio = require("twilio");
+const axios = require("axios");
+const qs = require("querystring");
 const cors = require("cors");
 const path = require("path");
 
@@ -13,6 +14,14 @@ const PORT = process.env.PORT || 3001;
 app.use(cors());
 app.use(express.json());
 app.use(express.urlencoded({ extended: false }));
+
+// Load environment variables when present
+require("dotenv").config();
+
+const META_TOKEN = process.env.META_WHATSAPP_TOKEN || "";
+const META_PHONE_ID = process.env.META_WHATSAPP_PHONE_ID || "";
+const WEBHOOK_VERIFY_TOKEN = process.env.WEBHOOK_VERIFY_TOKEN || "";
+const OPENAI_KEY = process.env.OPENAI_API_KEY || "";
 
 // Load 120 housing listings
 const homes = require("./basera-housing-120.json");
@@ -80,36 +89,41 @@ function extractBudgetRange(text) {
   let maxBudget = null;
   let minBudget = null;
 
-  // under 5000
-  let match = clean.match(
-    /(?:under|below|less than|within|upto|up to|max(?:imum)?|budget(?:\s+of)?)\s*(?:₹|rs\.?|rupees?)?\s*(\d+(?:\.\d+)?)\s*(k)?/i
-  );
+  const budgetPatterns = [
+    /(?:under|below|less than|within|upto|up to|max(?:imum)?|budget(?:\s+of)?)\s*(?:₹|rs\.?|rupees?)?\s*(\d+(?:\.\d+)?)\s*(k)?/i,
+    /(?:₹|rs\.?|rupees?)\s*(\d+(?:\.\d+)?)\s*(k)?/i,
+    /(\d+(?:\.\d+)?)\s*(k)\s*(?:budget|rupees|rs)?/i
+  ];
 
-  if (match) {
-    maxBudget = Number(match[1]);
-
-    if (match[2]) {
-      maxBudget *= 1000;
+  for (const pattern of budgetPatterns) {
+    const match = clean.match(pattern);
+    if (match) {
+      const value = Number(match[1]);
+      const expanded = match[2] ? value * 1000 : value;
+      if (!maxBudget) maxBudget = expanded;
+      break;
     }
   }
 
-  // above 5000
-  match = clean.match(
+  const minMatch = clean.match(
     /(?:above|over|more than|minimum|min)\s*(?:₹|rs\.?|rupees?)?\s*(\d+(?:\.\d+)?)\s*(k)?/i
   );
 
-  if (match) {
-    minBudget = Number(match[1]);
-
-    if (match[2]) {
-      minBudget *= 1000;
-    }
+  if (minMatch) {
+    minBudget = Number(minMatch[1]);
+    if (minMatch[2]) minBudget *= 1000;
   }
 
-  return {
-    minBudget,
-    maxBudget
-  };
+  const betweenMatch = clean.match(
+    /between\s*(?:₹|rs\.?|rupees?)?\s*(\d+(?:\.\d+)?)\s*(k)?\s*(?:and|to)\s*(?:₹|rs\.?|rupees?)?\s*(\d+(?:\.\d+)?)\s*(k)?/i
+  );
+
+  if (betweenMatch) {
+    minBudget = Number(betweenMatch[1]) * (betweenMatch[2] ? 1000 : 1);
+    maxBudget = Number(betweenMatch[3]) * (betweenMatch[4] ? 1000 : 1);
+  }
+
+  return { minBudget, maxBudget };
 }
 
 // ----------------------------------------------------
@@ -458,7 +472,28 @@ function formatResults(search) {
     intent
   } = search;
 
+  const topNearby = homes
+    .filter(home => {
+      if (filters.location && home.location.toLowerCase() !== filters.location.toLowerCase()) return false;
+      if (filters.roomType && home.roomType.toLowerCase() !== filters.roomType.toLowerCase()) return false;
+      return true;
+    })
+    .sort((a, b) => a.rent - b.rent)
+    .slice(0, 3);
+
   if (!results.length) {
+    const locationText = filters.location ? ` in ${filters.location}` : "";
+    const roomText = filters.roomType ? ` ${filters.roomType.toLowerCase()} room` : " room";
+    const budgetText = filters.maxBudget ? ` under ₹${filters.maxBudget}` : "";
+
+    if (topNearby.length) {
+      return (
+        `😔 I did not find an exact match${locationText}${budgetText}.\n\n` +
+        `Closest available options:${topNearby.map((home, index) => `\n${index + 1}. ${home.name} — ₹${home.rent}/month, ${home.location}, ${home.roomType}, ${home.commuteMinutes} min commute, ${home.verified ? 'verified' : 'verification pending'}`).join('')}` +
+        `\n\nTry increasing the budget by ₹500–₹1000 or choosing another nearby area.`
+      );
+    }
+
     return (
       "😔 Sorry! I couldn't find a matching home.\n\n" +
       "Try:\n" +
@@ -482,34 +517,15 @@ function formatResults(search) {
 
   let reply = `${title}\n\n`;
 
-  // Filter summary
-  if (filters.location) {
-    reply += `📍 Location: ${filters.location}\n`;
-  }
-
-  if (filters.roomType) {
-    reply += `🛏️ Type: ${filters.roomType}\n`;
-  }
-
-  if (filters.maxBudget) {
-    reply += `💰 Budget: Up to ₹${filters.maxBudget}\n`;
-  }
-
-  if (filters.minBudget) {
-    reply += `💰 Minimum: ₹${filters.minBudget}\n`;
-  }
-
-  if (filters.people) {
-    reply += `👥 People: ${filters.people}\n`;
-  }
-
-  if (filters.amenities.length) {
-    reply += `✨ Amenities: ${filters.amenities.join(", ")}\n`;
-  }
+  if (filters.location) reply += `📍 Location: ${filters.location}\n`;
+  if (filters.roomType) reply += `🛏️ Type: ${filters.roomType}\n`;
+  if (filters.maxBudget) reply += `💰 Budget: Up to ₹${filters.maxBudget}\n`;
+  if (filters.minBudget) reply += `💰 Minimum: ₹${filters.minBudget}\n`;
+  if (filters.people) reply += `👥 People: ${filters.people}\n`;
+  if (filters.amenities.length) reply += `✨ Amenities: ${filters.amenities.join(", ")}\n`;
 
   reply += `\nFound ${results.length} suitable homes.\n\n`;
 
-  // Show top 5
   results.slice(0, 5).forEach((home, index) => {
     reply +=
       `${index + 1}. 🏠 ${home.name}\n` +
@@ -520,19 +536,8 @@ function formatResults(search) {
       `⭐ Fair Rent: ${home.fairRentScore}/100\n` +
       `🛡️ Safety: ${home.safetyScore}/100\n` +
       `🚶 Commute: ${home.commuteMinutes} min\n` +
-      `💧 Water: ${home.water ? "Yes" : "No"}\n` +
-      `🚿 Bathroom: ${home.bathroom ? "Yes" : "No"}\n` +
-      `🍳 Kitchen: ${home.kitchen ? "Yes" : "No"}\n` +
-      `📶 WiFi: ${home.wifi ? "Yes" : "No"}\n` +
-      `${home.verified ? "✅ Verified" : "⚠️ Verification pending"}\n\n`;
+      `✅ Verified: ${home.verified ? "Yes" : "No"}\n\n`;
   });
-
-  reply +=
-    "💡 Try asking:\n" +
-    "\"Show me the cheapest room\"\n" +
-    "\"Safest room in Gandhipuram\"\n" +
-    "\"Shared room under ₹4000\"\n" +
-    "\"Private room with WiFi\"\n";
 
   return reply;
 }
@@ -864,33 +869,153 @@ app.get("/api/stats", (req, res) => {
 });
 
 // ----------------------------------------------------
+// META WHATSAPP CLOUD - VERIFICATION & WEBHOOK
+// ----------------------------------------------------
+
+app.get("/meta-webhook", (req, res) => {
+  const mode = req.query['hub.mode'];
+  const token = req.query['hub.verify_token'];
+  const challenge = req.query['hub.challenge'];
+
+  if (mode && token) {
+    if (mode === 'subscribe' && token === WEBHOOK_VERIFY_TOKEN) {
+      console.log('✅ Webhook verified');
+      return res.status(200).send(challenge);
+    } else {
+      return res.sendStatus(403);
+    }
+  }
+
+  res.sendStatus(400);
+});
+
+// Helper: send message via Meta WhatsApp Cloud
+async function sendMetaWhatsApp(to, text) {
+  if (!META_TOKEN || !META_PHONE_ID) {
+    throw new Error('Missing META_WHATSAPP_TOKEN or META_WHATSAPP_PHONE_ID');
+  }
+
+  const url = `https://graph.facebook.com/v17.0/${META_PHONE_ID}/messages`;
+
+  const payload = {
+    messaging_product: 'whatsapp',
+    to: to,
+    text: { body: text }
+  };
+
+  const resp = await axios.post(url, payload, {
+    headers: {
+      Authorization: `Bearer ${META_TOKEN}`,
+      'Content-Type': 'application/json'
+    }
+  });
+
+  return resp.data;
+}
+
+// Use OpenAI to enhance the reply (optional)
+async function generateAIReply(systemPrompt, userMessage) {
+  if (!OPENAI_KEY) return null;
+
+  try {
+    const url = 'https://api.openai.com/v1/chat/completions';
+    const resp = await axios.post(url, {
+      model: 'gpt-4o-mini',
+      messages: [
+        { role: 'system', content: systemPrompt },
+        { role: 'user', content: userMessage }
+      ],
+      max_tokens: 600
+    }, {
+      headers: {
+        Authorization: `Bearer ${OPENAI_KEY}`,
+        'Content-Type': 'application/json'
+      }
+    });
+
+    return resp.data.choices?.[0]?.message?.content || null;
+  } catch (err) {
+    console.error('OpenAI error', err?.response?.data || err.message);
+    return null;
+  }
+}
+
+// Meta webhook receiver
+app.post('/meta-webhook', async (req, res) => {
+  try {
+    const body = req.body;
+
+    // Basic safety
+    if (!body || !body.entry) return res.sendStatus(400);
+
+    // Process each incoming message
+    for (const entry of body.entry || []) {
+      for (const change of entry.changes || []) {
+        const value = change.value || {};
+        if (!value.messages) continue;
+
+        for (const message of value.messages) {
+          const from = message.from; // phone number
+          const text = message.text?.body || '';
+
+          console.log('📩 Meta incoming from', from, text);
+
+          const search = searchHomes(text);
+          const formatted = formatResults(search);
+
+          // Optionally let OpenAI rewrite the reply for readability
+          let reply = formatted;
+
+          if (OPENAI_KEY) {
+            const system = 'You are Basera assistant. Create a concise friendly reply for a worker searching housing. Use the information provided and keep language simple.';
+            const ai = await generateAIReply(system, formatted);
+            if (ai) reply = ai;
+          }
+
+          // Send reply back
+          try {
+            await sendMetaWhatsApp(from, reply);
+            console.log('✅ Replied to', from);
+          } catch (err) {
+            console.error('Failed to send reply', err?.response?.data || err.message);
+          }
+        }
+      }
+    }
+
+    res.sendStatus(200);
+  } catch (error) {
+    console.error('meta-webhook error', error);
+    res.sendStatus(500);
+  }
+});
+
+// Endpoint: send WhatsApp message from UI
+app.post('/api/send-whatsapp', async (req, res) => {
+  try {
+    const to = req.body.to;
+    const message = req.body.message;
+
+    if (!to || !message) return res.status(400).json({ success: false, message: 'to and message required' });
+
+    const resp = await sendMetaWhatsApp(to, message);
+
+    res.json({ success: true, resp });
+  } catch (err) {
+    console.error('send-whatsapp error', err?.response?.data || err.message);
+    res.status(500).json({ success: false, error: err?.message || 'send error' });
+  }
+});
+
+// ----------------------------------------------------
 // WHATSAPP WEBHOOK
 // ----------------------------------------------------
 
 app.post("/whatsapp", (req, res) => {
   try {
-    const incomingMessage =
-      req.body.Body || "";
-
-    console.log(
-      "📱 WhatsApp message:",
-      incomingMessage
-    );
-
-    const search =
-      searchHomes(incomingMessage);
-
-    const reply =
-      formatResults(search);
-
-    const twiml =
-      new twilio.twiml.MessagingResponse();
-
-    twiml.message(reply);
-
-    res
-      .type("text/xml")
-      .send(twiml.toString());
+    // This endpoint was originally implemented for Twilio.
+    // For Meta WhatsApp Cloud integration we use a separate webhook below (/meta-webhook).
+    res.json({ success: true, message: "Use /meta-webhook for Meta WhatsApp Cloud integrations" });
 
   } catch (error) {
     console.error(
